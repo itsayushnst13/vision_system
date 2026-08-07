@@ -64,62 +64,94 @@ what has been verified and what has not.
   tracking loop yet — this is the natural next step now that the tracker
   itself is bug-fixed and produces a clean (if drifting) trajectory.
 
-### Loop-closure classifier: real-label retraining
+### Loop-closure classifier: real-label retraining and live integration
 
-`src/cnn_loop_closure.py` / `src/random_forest_loop_closure.py` originally
-trained their Random Forest classifier on synthetic Gaussian feature
-vectors with labels from a hand-written heuristic formula — it never saw a
-real loop closure. This has been addressed:
+This went through three honest iterations — each one surfaced a genuine
+new problem, which is itself the point of documenting it here.
 
-- `evaluation/retrain_loop_closure_real_labels.py` builds a **real**
-  labeled dataset directly from TUM RGB-D ground truth: positive pairs are
-  frames whose ground-truth camera positions are spatially close
-  (< 0.08 m) but temporally separated by > 5 s (a genuine revisit);
-  negative pairs are spatially far apart (> 0.5 m). SIFT-based match
-  features are extracted for each real pair and a Random Forest is
-  trained on this real signal.
-  - Note: the CNN (ResNet18) similarity feature from the original pipeline
-    is **not** included — PyTorch could not be installed in this
-    environment (disk constraints). The retrained classifier uses the
-    remaining 8 classical SIFT-based features. Documented simplification,
-    not a silent omission.
+**v1 -- synthetic labels (original code).** Trained on fabricated Gaussian
+feature vectors with heuristic labels; never saw a real loop closure.
+Result on a real held-out test: 32% accuracy, 2% recall (missed 98% of
+genuine loop closures despite a "reasonable" 0.977 AUC — badly
+miscalibrated).
 
-- **Head-to-head result (same held-out real test set, 145 pairs):**
+**v2a -- real labels, easy margin.** Retrained using TUM ground truth to
+auto-generate real labels: positive = spatially close (<0.08m) +
+temporally separated (>5s) frame pairs; negative = spatially far apart
+(>0.5m). Result: 100% accuracy / 100% recall on held-out test — but when
+wired into the live SLAM loop (`src/system.py`), it **catastrophically
+over-triggered**, flagging ~1 in 8 new keyframes as a loop closure against
+essentially any earlier keyframe, and the resulting pose-graph correction
+diverged (unaligned ATE went from 0.65m to over 2 **billion** meters). The
+100% test accuracy was an artifact of a too-easy, too-widely-separated
+train/test split that never exposed the classifier to the "nearby but not
+actually the same place" cases it has to handle at deployment time.
 
-  | Model | Accuracy | ROC-AUC | Loop-closure recall |
-  |---|---|---|---|
-  | Original (synthetic-trained) | 0.324 | 0.977 | 0.02 |
-  | Retrained (real-labeled) | 1.000 | 1.000 | 1.00 |
+**v2b -- real labels, hard-negative mining.** Retrained with an added hard
+negative class: frame pairs in the ambiguous 0.12m–0.35m range (nearby,
+not a revisit). Held-out accuracy dropped to a far more credible 94%
+(precision 0.92 / recall 0.94 on the loop class) — the harder, more
+realistic test genuinely separates learning from memorizing an easy
+boundary. When wired into the live loop, false-positive triggers dropped
+substantially, but **not to zero**: over 133 frames, 16 candidate loop
+closures were still flagged, most of them false. This is a distinct and
+important finding, separate from calibration: it's a **base-rate /
+class-imbalance problem**. Training data was roughly balanced
+(250 positive / 350 negative), but live deployment queries every new
+keyframe against several older candidates, the overwhelming majority of
+which are true negatives — so even a model with good *balanced* accuracy
+produces many more false positives than true positives in absolute
+deployment terms, because true loop closures are rare relative to the
+number of candidate pairs actually queried.
 
-  The synthetic-trained model has a *reasonable* AUC (its features carry
-  some real signal) but is **badly miscalibrated**: at its default
-  decision threshold it misses 98% of genuine loop closures. Training on
-  real, ground-truth-derived labels fixes this.
+**Safety guard (implemented, and this is the part that's actually
+production-safe right now).** Rather than trust every classifier
+"loop closure" and risk pose-graph divergence, `src/system.py` now
+sanity-checks every proposed correction in `pose_graph_optimizer.py`:
+if applying it would move any keyframe further than ~10x the trajectory's
+own spatial extent, the correction is rejected outright and the
+trajectory is left uncorrected. Re-running the v2b classifier live with
+this guard in place: **all 16 flagged loop closures were correctly
+rejected as destabilizing**, and the trajectory matched the
+loop-closure-disabled baseline exactly (ATE 0.6517m unaligned, both
+runs) — no corruption, but also no measured improvement yet, because this
+particular short sequence didn't happen to contain a loop closure the
+classifier got right without also raising false positives.
 
-- **Honest caveat on the 1.00/1.00 result:** the positive/negative distance
-  thresholds (0.08 m vs 0.5 m) leave a wide margin, which makes this
-  particular test split easy to separate — a strong result here is not
-  proof of robustness on harder, near-threshold cases. A follow-up should
-  narrow that margin (e.g. hard-negative mining just outside 0.08 m) for a
-  more demanding evaluation.
-
-- Artifacts: `results/rf_loop_closure_REAL_labels.joblib`,
-  `results/rf_scaler_REAL_labels.joblib`, `results/real_label_eval.npz`.
+- **Where this honestly stands:** the classifier is not yet reliable
+  enough to trust blindly, but the system is now safe to run with loop
+  closure enabled — it degrades gracefully to the uncorrected baseline
+  rather than corrupting the trajectory. This is a real, deployable
+  improvement over where the code started (no keyframe storage at all,
+  synthetic-only training, and no safety check).
+- **Concrete next step to get an actual accuracy improvement (not just
+  safety):** calibrate the decision threshold for the true deployment
+  base rate (few true positives per many queries) rather than the
+  balanced-training default, and/or require N-consecutive-frame
+  consistency before accepting a candidate loop closure — standard
+  practice in production SLAM systems, not yet implemented here.
+- Artifacts: `results/rf_loop_closure_REAL_labels.joblib` (current, v2b,
+  hard-negative-mined), `results/rf_loop_closure_REAL_labels_v1_easy.joblib`
+  (kept for comparison), `results/loop_closure_comparison.npz` (live
+  on/off run), `results/real_label_eval.npz` (v2b held-out test set).
 
 ## Repository layout
 
 ```
 vision_system/
 ├── src/
-│   ├── system.py                     # Main SLAM system (ORBSlam3 class)
+│   ├── system.py                     # Main SLAM system (ORBSlam3 class) -- now with keyframe storage + loop closure wiring
 │   ├── tracking.py                   # Feature tracking + pose estimation (RANSAC-PnP fix applied)
 │   ├── mapping.py                    # Basic mapping
 │   ├── run_slam.py                   # Interactive runner (webcam/video/image seq)
+│   ├── loop_closure_detector.py      # Wraps trained classifier for live use (NEW)
+│   ├── pose_graph_optimizer.py       # Lightweight scipy pose-graph correction + safety guard (NEW)
 │   ├── cnn_loop_closure.py           # CNN+RF loop closure (original, synthetic-trained)
 │   └── random_forest_loop_closure.py
 ├── evaluation/
 │   ├── evaluate_tum.py                        # Headless TUM RGB-D VO evaluator
-│   └── retrain_loop_closure_real_labels.py    # Real-label loop-closure retraining + eval
+│   ├── retrain_loop_closure_real_labels.py    # Real-label loop-closure retraining + eval
+│   └── evaluate_tum_with_loop_closure.py      # Live loop-closure ON vs OFF comparison (NEW)
 ├── config/
 │   └── camera_config.yaml
 ├── results/
@@ -145,18 +177,24 @@ python -m venv venv && source venv/bin/activate
 pip install opencv-python-headless numpy scipy matplotlib PyYAML scikit-learn joblib
 python evaluation/evaluate_tum.py                          # VO/tracking evaluation
 python evaluation/retrain_loop_closure_real_labels.py       # Loop-closure retraining + eval
+python evaluation/evaluate_tum_with_loop_closure.py         # Live loop-closure ON vs OFF comparison
 ```
 
 ## Next steps (tracked honestly, not yet done)
 
-1. Implement pose-graph optimization / loop-closure correction to address
-   the residual ~10x drift documented above (the tracker itself is now
-   bug-fixed; this is the remaining structural gap).
-2. Harden the real-label loop-closure evaluation with hard negatives near
-   the 0.08 m boundary, to get a less trivially-separable benchmark.
+1. Calibrate the loop-closure decision threshold for the true deployment
+   base rate (few genuine loop closures per many candidate queries),
+   rather than the balanced-training default -- this is the most direct
+   path to fewer false-positive triggers.
+2. Require N-consecutive-frame consistency before accepting a candidate
+   loop closure (standard production-SLAM practice), instead of acting on
+   a single frame's classification.
 3. Re-add the CNN (ResNet18) similarity feature once a PyTorch install is
    available, and re-run the real-vs-synthetic comparison with it included.
-4. Wire the retrained real-label classifier into the main SLAM loop as an
-   actual loop-closure trigger, then correct the drifting trajectory and
-   re-measure ATE — this is the strongest candidate for the paper's core
-   empirical result (failure mode → fix → quantitative before/after).
+4. Extend the pose-graph optimizer to correct rotation, not just
+   translation, once (1) and (2) make loop closures trustworthy enough to
+   actually accept.
+5. Find or construct a longer sequence with a genuine, unambiguous loop
+   closure to demonstrate a real before/after ATE improvement -- the
+   current freiburg1_xyz subset used here doesn't contain one that this
+   classifier can isolate cleanly from the false positives.

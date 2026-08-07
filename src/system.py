@@ -1,19 +1,31 @@
 import numpy as np
 import cv2
 import threading
+import os
 from typing import Optional, Dict, List, Tuple
 from tracking import Tracker
+from pose_graph_optimizer import PoseGraphOptimizer
+
+try:
+    from loop_closure_detector import LoopClosureDetector
+    _HAS_LOOP_CLOSURE_MODULE = True
+except ImportError:
+    _HAS_LOOP_CLOSURE_MODULE = False
 
 class ORBSlam3:
     """
     Main class for ORB-SLAM3 system that coordinates all the SLAM components.
     """
-    def __init__(self, config_path: str):
+    def __init__(self, config_path: str, enable_loop_closure: bool = True):
         """
         Initialize ORB-SLAM3 system.
         
         Args:
             config_path: Path to the configuration file
+            enable_loop_closure: Whether to attempt loop-closure detection and
+                trajectory correction. Silently disabled (with a warning) if
+                the trained classifier files aren't found, consistent with
+                this codebase's graceful-degradation approach elsewhere.
         """
         self.config_path = config_path
         self.is_running = False
@@ -38,6 +50,20 @@ class ORBSlam3:
         self.min_keyframe_translation = 0.1  # meters
         self.last_keyframe_pose = np.eye(4)
         self.keyframe_counter = 0
+
+        # Loop closure state
+        self.enable_loop_closure = enable_loop_closure
+        self.loop_detector = None
+        self.loop_pairs: List[Tuple[int, int]] = []  # (keyframe_idx_i, keyframe_idx_j)
+        self.loop_check_min_keyframe_gap = 15  # only check keyframes this far apart
+        self.loop_confidence_threshold = 0.9   # stricter than the classifier's own 0.5
+                                                # default -- see README: the real-labeled
+                                                # classifier was trained on an easily-
+                                                # separable split and over-triggers on
+                                                # visually similar (but not truly revisited)
+                                                # frames at its default threshold.
+        self.loop_max_candidates_per_check = 8   # cap comparisons for tractability
+        self.pose_graph_optimizer = PoseGraphOptimizer()
         
         # Threading locks
         self.map_update_lock = threading.Lock()
@@ -87,6 +113,19 @@ class ORBSlam3:
             
             # Initialize tracker
             self.tracker = Tracker(self.camera_matrix, self.dist_coeffs)
+
+            # Initialize loop closure detector (optional, graceful degradation)
+            if self.enable_loop_closure and _HAS_LOOP_CLOSURE_MODULE:
+                model_path = os.path.join(os.path.dirname(__file__), "..", "results",
+                                           "rf_loop_closure_REAL_labels.joblib")
+                scaler_path = os.path.join(os.path.dirname(__file__), "..", "results",
+                                            "rf_scaler_REAL_labels.joblib")
+                try:
+                    self.loop_detector = LoopClosureDetector(model_path, scaler_path)
+                    print("Loop closure detector loaded (real-labeled classifier).")
+                except FileNotFoundError as e:
+                    print(f"Loop closure disabled: {e}")
+                    self.loop_detector = None
             
             self.is_running = True
             return True
@@ -193,10 +232,105 @@ class ORBSlam3:
             for i, kp in enumerate(keypoints):
                 pt = np.array([kp.pt[0], kp.pt[1], 1.0])
                 points_3d[i] = (np.linalg.inv(pose)[:3, :3] @ pt) + pose[:3, 3]
-        
+
+        # Store the keyframe -- previously this method computed points_3d and
+        # discarded it without ever appending to self.keyframes, so
+        # get_map_points()/loop closure had nothing to work with. Fixed here.
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+        self.keyframes.append({
+            "image_gray": gray,
+            "pose": pose.copy(),
+            "trajectory_index": len(self.trajectory) - 1,  # index into self.trajectory
+            "points_3d": points_3d,
+        })
+
         # Update state
         self.last_keyframe_pose = pose.copy()
         self.keyframe_counter += 1
+
+        # Loop closure check: compare this new keyframe against sufficiently
+        # older keyframes only (mirrors the temporal-separation criterion
+        # used when the classifier was trained on real labels).
+        if self.loop_detector is not None and len(self.keyframes) > self.loop_check_min_keyframe_gap:
+            new_idx = len(self.keyframes) - 1
+            all_candidates = list(range(0, new_idx - self.loop_check_min_keyframe_gap + 1))
+            # Cap the number of comparisons for tractability: evenly
+            # subsample candidates rather than checking every older keyframe.
+            if len(all_candidates) > self.loop_max_candidates_per_check:
+                step = len(all_candidates) / self.loop_max_candidates_per_check
+                candidates = [all_candidates[int(i * step)] for i in range(self.loop_max_candidates_per_check)]
+            else:
+                candidates = all_candidates
+            best_j, best_conf = None, 0.0
+            for j in candidates:
+                is_loop, conf = self.loop_detector.check(
+                    self.keyframes[j]["image_gray"], gray
+                )
+                if conf > self.loop_confidence_threshold and conf > best_conf:
+                    best_j, best_conf = j, conf
+            if best_j is not None:
+                print(f"Loop closure detected: keyframe {best_j} <-> {new_idx} "
+                      f"(confidence={best_conf:.3f})")
+                self.loop_pairs.append((best_j, new_idx))
+                # Re-optimizing on every single detection is expensive
+                # (O(n) least-squares solve each time); batch corrections
+                # instead of triggering one per detection.
+                if len(self.loop_pairs) % 5 == 0:
+                    self._correct_trajectory_with_loop_closures()
+
+    def _correct_trajectory_with_loop_closures(self):
+        """
+        Run pose-graph correction using all detected loop closures so far.
+
+        Simplification: this optimizes and corrects the TRANSLATION
+        component of keyframe poses only (rotation is left as estimated by
+        the tracker). The resulting per-keyframe correction offset is then
+        linearly interpolated onto the full (non-keyframe) trajectory
+        between keyframes. This is a deliberately lightweight approach in
+        the absence of GTSAM -- see pose_graph_optimizer.py.
+        """
+        if not self.loop_pairs or len(self.keyframes) < 2:
+            return
+
+        kf_positions = np.array([kf["pose"][:3, 3] for kf in self.keyframes])
+        corrected = self.pose_graph_optimizer.optimize(kf_positions, self.loop_pairs)
+
+        # Safety guard: a genuinely mistaken loop-closure constraint (false
+        # positive) can make the least-squares solve diverge wildly. Reject
+        # the correction outright if it would move any keyframe further
+        # than a few times the trajectory's own spatial extent -- that is
+        # never a legitimate correction, only a solver blow-up.
+        traj_extent = np.linalg.norm(kf_positions.max(axis=0) - kf_positions.min(axis=0))
+        max_shift = np.max(np.linalg.norm(corrected - kf_positions, axis=1))
+        sanity_limit = max(10.0 * traj_extent, 1.0)  # generous but bounded
+        if max_shift > sanity_limit:
+            print(f"Loop closure correction REJECTED: proposed shift "
+                  f"{max_shift:.2f}m exceeds sanity limit {sanity_limit:.2f}m "
+                  f"(likely a false-positive loop closure destabilizing the "
+                  f"pose graph). Trajectory left uncorrected.")
+            return
+
+        with self.map_update_lock:
+            for k, kf in enumerate(self.keyframes):
+                offset = corrected[k] - kf_positions[k]
+                kf["pose"][:3, 3] = corrected[k]
+
+                # Apply this keyframe's correction as a piecewise-constant
+                # offset to all trajectory entries up to the next keyframe.
+                # (A true SE(3) pose-graph would interpolate rotations too;
+                # here we only correct translation, documented above.)
+                start = kf["trajectory_index"]
+                end = (self.keyframes[k + 1]["trajectory_index"]
+                       if k + 1 < len(self.keyframes) else len(self.trajectory))
+                for t in range(start, min(end, len(self.trajectory))):
+                    self.trajectory[t][:3, 3] += offset
+
+
+
+    def flush_loop_closures(self):
+        """Force a pose-graph correction pass using all loop closures found
+        so far (in case the last batch didn't reach the auto-trigger count)."""
+        self._correct_trajectory_with_loop_closures()
 
     def shutdown(self):
         """

@@ -2,19 +2,29 @@
 Retrain the loop-closure classifier on REAL labels derived from ground truth,
 instead of the original synthetic/fabricated training data.
 
-Label generation strategy (grounded in real data, not hand-labeling by eye):
-  - POSITIVE (loop closure): frame pairs whose ground-truth camera positions
-    are spatially close (< POS_THRESH) but temporally far apart
-    (> TIME_GAP), i.e. the camera genuinely revisited the same place.
-  - NEGATIVE (no loop closure): frame pairs that are spatially far apart
-    (> NEG_THRESH), regardless of time gap.
+v2 -- HARD NEGATIVE MINING
+===========================
+The first version of this script (see git history) used a wide margin
+between positive (<0.08m) and negative (>0.5m) distance thresholds. That
+produced a classifier with perfect held-out test accuracy, but when wired
+into the live SLAM pipeline it catastrophically over-triggered: almost
+every new keyframe was flagged as a loop closure against an early keyframe,
+because most real frame pairs during live tracking fall in the AMBIGUOUS
+MIDDLE GROUND (nearby, but not the same place) that the original training
+set never sampled from.
 
-Features are the SAME feature set the original code used (SIFT match count,
-match ratio, distance statistics, spatial distance statistics) -- MINUS the
-CNN similarity feature, since a CNN feature extractor (ResNet18/PyTorch) is
-not available in this environment. This is a deliberate, documented
-simplification: it does not affect the validity of the real-vs-synthetic
-label comparison, since both classifiers use the same feature set.
+This version adds a HARD NEGATIVE class: frame pairs that are moderately
+close (between HARD_NEG_MIN and HARD_NEG_MAX) but NOT close enough to count
+as a true revisit. These are the pairs the live pipeline actually has to
+disambiguate, so the classifier needs to see them during training.
+
+Label generation:
+  - POSITIVE (loop closure): spatially close (< POS_THRESH) AND temporally
+    separated (> TIME_GAP) -- a genuine revisit.
+  - HARD NEGATIVE: spatial distance in [HARD_NEG_MIN, HARD_NEG_MAX] --
+    nearby but not a revisit. This is the case that was missing before.
+  - EASY NEGATIVE: spatially far apart (> NEG_THRESH), regardless of time
+    gap -- kept for coverage of clearly-different scenes.
 """
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -29,10 +39,14 @@ from sklearn.metrics import classification_report, accuracy_score, roc_auc_score
 
 DATASET = os.path.join(os.path.dirname(__file__), "..", "..",
                         "Loop_Closure_and_Algorithms", "data", "rgbd_dataset_freiburg1_xyz")
-POS_THRESH = 0.08   # meters -- "same place"
-NEG_THRESH = 0.5    # meters -- "clearly different place"
-TIME_GAP = 5.0       # seconds -- must be temporally separated to count as a "revisit"
-N_PAIRS_PER_CLASS = 400
+POS_THRESH = 0.08     # meters -- "same place" (true revisit)
+HARD_NEG_MIN = 0.12   # meters -- start of the ambiguous "nearby but different" zone
+HARD_NEG_MAX = 0.35   # meters -- end of that zone
+NEG_THRESH = 0.5      # meters -- "clearly different place" (easy negative)
+TIME_GAP = 5.0         # seconds -- must be temporally separated to count as a "revisit"
+N_POS = 250
+N_HARD_NEG = 250
+N_EASY_NEG = 100
 RNG_SEED = 42
 
 
@@ -116,8 +130,9 @@ def main():
     n = len(rgb_list)
     print(f"Loaded {n} frames with ground-truth positions.")
 
-    # Build candidate pairs
-    pos_pairs, neg_pairs = [], []
+    # Build candidate pairs across three buckets: positive, hard negative,
+    # easy negative.
+    pos_pairs, hard_neg_pairs, easy_neg_pairs = [], [], []
     idx_pool = np.arange(0, n, 3)  # subsample for tractability
     for a in range(len(idx_pool)):
         i = idx_pool[a]
@@ -128,22 +143,31 @@ def main():
             d = np.linalg.norm(frame_positions[j] - frame_positions[i])
             if d < POS_THRESH:
                 pos_pairs.append((i, j))
+            elif HARD_NEG_MIN <= d <= HARD_NEG_MAX:
+                hard_neg_pairs.append((i, j))
             elif d > NEG_THRESH:
-                neg_pairs.append((i, j))
+                easy_neg_pairs.append((i, j))
 
-    print(f"Candidate positives: {len(pos_pairs)}, candidate negatives: {len(neg_pairs)}")
+    print(f"Candidates -- positive: {len(pos_pairs)}, hard negative: {len(hard_neg_pairs)}, "
+          f"easy negative: {len(easy_neg_pairs)}")
 
     rng.shuffle(pos_pairs)
-    rng.shuffle(neg_pairs)
-    pos_pairs = pos_pairs[:N_PAIRS_PER_CLASS]
-    neg_pairs = neg_pairs[:N_PAIRS_PER_CLASS]
-    print(f"Sampled {len(pos_pairs)} positive / {len(neg_pairs)} negative pairs for feature extraction.")
+    rng.shuffle(hard_neg_pairs)
+    rng.shuffle(easy_neg_pairs)
+    pos_pairs = pos_pairs[:N_POS]
+    hard_neg_pairs = hard_neg_pairs[:N_HARD_NEG]
+    easy_neg_pairs = easy_neg_pairs[:N_EASY_NEG]
+    print(f"Sampled {len(pos_pairs)} positive / {len(hard_neg_pairs)} hard-negative / "
+          f"{len(easy_neg_pairs)} easy-negative pairs for feature extraction.")
 
     sift = cv2.SIFT_create()
     matcher = cv2.BFMatcher()
 
     X, y = [], []
-    all_pairs = [(p, 1) for p in pos_pairs] + [(p, 0) for p in neg_pairs]
+    all_pairs = ([(p, 1) for p in pos_pairs] +
+                 [(p, 0) for p in hard_neg_pairs] +
+                 [(p, 0) for p in easy_neg_pairs])
+    rng.shuffle(all_pairs)
     for k, ((i, j), label) in enumerate(all_pairs):
         p1 = os.path.join(DATASET, rgb_list[i][1])
         p2 = os.path.join(DATASET, rgb_list[j][1])
@@ -191,7 +215,7 @@ def main():
     np.savez(os.path.join(out_dir, "real_label_eval.npz"),
              X_test=X_test, y_test=y_test, y_pred=y_pred, y_proba=y_proba,
              accuracy=acc, auc=auc)
-    print(f"\nModel + eval results saved to {out_dir}/")
+    print(f"\nModel + eval results saved to {out_dir}/ (with hard-negative mining, v2)")
 
 
 if __name__ == "__main__":
