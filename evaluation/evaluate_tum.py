@@ -5,11 +5,13 @@ Uses depth images (RGB-D mode / PnP tracking) for metric-scale trajectory estima
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.dirname(__file__))
 
 import numpy as np
 import cv2
 import yaml
 from system import ORBSlam3
+from metrics import align, compute_ate, compute_rpe, trajectory_length, max_step
 
 DATASET = os.path.join(os.path.dirname(__file__), "..", "data", "rgbd_dataset_freiburg1_xyz")
 CONFIG = os.path.join(os.path.dirname(__file__), "..", "config", "camera_config.yaml")
@@ -107,53 +109,64 @@ def main():
     est_xyz = np.array([p[1:4] for p in est_traj])
     gt_xyz = np.array([p[1:4] for p in gt_traj])
 
-    # Umeyama alignment (with scale, since PnP-based tracking should already be metric,
-    # but we report both to be transparent about residual scale error)
-    def align(est, gt, with_scale=True):
-        mu_est = est.mean(axis=0)
-        mu_gt = gt.mean(axis=0)
-        est_c = est - mu_est
-        gt_c = gt - mu_gt
-        if with_scale:
-            scale = np.sqrt((gt_c**2).sum()) / (np.sqrt((est_c**2).sum()) + 1e-12)
-        else:
-            scale = 1.0
-        H = (est_c * scale).T @ gt_c
-        U, S, Vt = np.linalg.svd(H)
-        d = np.linalg.det(Vt.T @ U.T)
-        D = np.diag([1, 1, d])
-        R = Vt.T @ D @ U.T
-        t = mu_gt - R @ (mu_est * scale)
-        aligned = (R @ (est * scale).T).T + t
-        return aligned, scale
-
+    # Metrics come from the shared evaluation/metrics.py module so that every
+    # script in this repo reports numbers computed the exact same way.
+    ate_scaled = compute_ate(est_xyz, gt_xyz, with_scale=True)
+    ate_noscale = compute_ate(est_xyz, gt_xyz, with_scale=False)
     aligned_scaled, scale_factor = align(est_xyz, gt_xyz, with_scale=True)
     aligned_noscale, _ = align(est_xyz, gt_xyz, with_scale=False)
-
     errors_scaled = np.linalg.norm(aligned_scaled - gt_xyz, axis=1)
     errors_noscale = np.linalg.norm(aligned_noscale - gt_xyz, axis=1)
 
-    print("\n" + "=" * 55)
-    print("  TUM RGB-D freiburg1_xyz — Evaluation Results")
-    print("=" * 55)
-    print(f"  Poses evaluated:            {len(est_traj)}")
-    print(f"  Recovered scale factor:     {scale_factor:.4f}  (1.0 = perfectly metric)")
-    print(f"\n  --- With scale correction (Sim(3) alignment) ---")
-    print(f"  ATE RMSE:  {np.sqrt(np.mean(errors_scaled**2)):.4f} m")
-    print(f"  ATE Mean:  {np.mean(errors_scaled):.4f} m")
-    print(f"  ATE Max:   {np.max(errors_scaled):.4f} m")
-    print(f"\n  --- Without scale correction (SE(3) alignment only) ---")
-    print(f"  ATE RMSE:  {np.sqrt(np.mean(errors_noscale**2)):.4f} m")
-    print(f"  ATE Mean:  {np.mean(errors_noscale):.4f} m")
-    print(f"  ATE Max:   {np.max(errors_noscale):.4f} m")
-    print("=" * 55)
+    # RPE at several deltas: local tracking quality, insensitive to the
+    # global drift that dominates ATE.
+    rpe = {d: compute_rpe(est_xyz, gt_xyz, delta=d) for d in (1, 10, 30)}
+
+    print("\n" + "=" * 62)
+    print("  TUM RGB-D freiburg1_xyz — Visual Odometry Evaluation")
+    print("=" * 62)
+    print(f"  Poses evaluated:          {ate_scaled['n']}")
+    print(f"  Recovered scale factor:   {scale_factor:.4f}  (1.0 = perfectly metric)")
+    print(f"  Est. trajectory length:   {trajectory_length(est_xyz):.3f} m")
+    print(f"  GT   trajectory length:   {trajectory_length(gt_xyz):.3f} m")
+    print(f"  Largest single-frame step:{max_step(est_xyz):.4f} m "
+          f"(GT: {max_step(gt_xyz):.4f} m)")
+
+    print("\n  --- ATE, Sim(3) alignment (scale corrected) ---")
+    print(f"  RMSE {ate_scaled['rmse']:.4f} m | mean {ate_scaled['mean']:.4f} | "
+          f"median {ate_scaled['median']:.4f} | std {ate_scaled['std']:.4f} | "
+          f"max {ate_scaled['max']:.4f}")
+
+    print("\n  --- ATE, SE(3) alignment (raw accumulated drift) ---")
+    print(f"  RMSE {ate_noscale['rmse']:.4f} m | mean {ate_noscale['mean']:.4f} | "
+          f"median {ate_noscale['median']:.4f} | std {ate_noscale['std']:.4f} | "
+          f"max {ate_noscale['max']:.4f}")
+
+    print("\n  --- RPE (translation), local tracking quality ---")
+    for d, r in rpe.items():
+        if r:
+            print(f"  delta={d:>3} frames:  RMSE {r['rmse']:.4f} m | "
+                  f"mean {r['mean']:.4f} | median {r['median']:.4f}")
+    print("=" * 62)
 
     os.makedirs(os.path.join(os.path.dirname(__file__), "..", "results"), exist_ok=True)
+    save_kwargs = dict(
+        est_xyz=est_xyz, gt_xyz=gt_xyz,
+        aligned_scaled=aligned_scaled, aligned_noscale=aligned_noscale,
+        errors_scaled=errors_scaled, errors_noscale=errors_noscale,
+        scale_factor=scale_factor,
+    )
+    for k, v in ate_scaled.items():
+        save_kwargs[f"ate_scaled_{k}"] = v
+    for k, v in ate_noscale.items():
+        save_kwargs[f"ate_noscale_{k}"] = v
+    for d, r in rpe.items():
+        if r:
+            for k, v in r.items():
+                save_kwargs[f"rpe{d}_{k}"] = v
+
     np.savez(os.path.join(os.path.dirname(__file__), "..", "results", "tum_eval.npz"),
-             est_xyz=est_xyz, gt_xyz=gt_xyz,
-             aligned_scaled=aligned_scaled, aligned_noscale=aligned_noscale,
-             errors_scaled=errors_scaled, errors_noscale=errors_noscale,
-             scale_factor=scale_factor)
+             **save_kwargs)
     print("\nRaw results saved to results/tum_eval.npz")
 
 
