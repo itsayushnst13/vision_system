@@ -1,0 +1,60 @@
+# KITTI Camera Parameters (real-world sequence)
+Camera:
+  # TUM RGB-D fr1/xyz camera parameters
+  fx: 517.3  # focal length x
+  fy: 516.5  # focal length y
+  cx: 318.6  # optical center x
+  cy: 255.3  # optical center y
+  
+  # Distortion parameters
+  k1: 0.2624
+  k2: -0.9531
+  p1: -0.0054
+  p2: 0.0026
+  k3: 1.1633
+  
+  # Image dimensions
+  width: 640
+  height: 480
+  
+  # Depth camera parameters
+  depth_scale: 5000.0  # for converting raw depth to meters
+  depth_min: 0.5      # minimum depth in meters
+  depth_max: 5.0      # maximum depth in meters
+  
+  # Frame rate
+  fps: 10
+  
+# ORB Parameters (tuned for urban environments)
+ORB:
+  nfeatures: 4000  # More features for robust tracking
+  scale_factor: 1.2
+  nlevels: 8
+  edge_threshold: 31  # Larger threshold for better feature distribution
+  first_level: 0
+  WTA_K: 2
+  patch_size: 31
+  fast_threshold: 12  # Lower threshold to detect more features
+  
+# Loop Closure Parameters
+LoopClosure:
+  min_loop_score: 0.70  # Higher threshold for more reliable loops
+  min_inliers: 75  # More inliers required for real data
+  search_radius: 50  # Number of frames to search back
+  vocab_size: 1500  # Larger vocabulary for better place recognition
+
+# Tracking Parameters
+Tracking:
+  minMatches: 50  # More matches required for reliable tracking
+  maxFrames: 200
+
+# Mapping Parameters
+Mapping:
+  minTriangulationAngle: 2.0  # Minimum angle for triangulation (degrees)
+  minObservations: 3  # Minimum observations for a map point
+  maxReprojectionError: 2.0  # Maximum reprojection error (pixels)
+
+# Loop Closing Parameters
+LoopClosing:
+  minConsistentGroups: 3  # Number of consistent groups required
+  maxLoopSearchTime: 0.2  # Maximum time for loop detection (seconds) 
