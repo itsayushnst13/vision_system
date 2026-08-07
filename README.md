@@ -60,16 +60,51 @@ what has been verified and what has not.
 ### Known unresolved issues
 - **Trajectory drift without loop closure (see above)** — this is the main
   remaining item, and it's architectural rather than a single bug.
-- `src/cnn_loop_closure.py` + `src/random_forest_loop_closure.py`: the
-  Random Forest loop-closure classifier included here was originally
-  trained on **synthetically generated features/labels**, not on real
-  annotated loop closures. Its outputs should **not** be treated as a
-  validated loop-closure detector until retrained on real labeled pairs.
-  This is flagged explicitly so it is not accidentally cited as a working
-  result.
 - No formal loop-closure pose-graph correction is integrated into the main
   tracking loop yet — this is the natural next step now that the tracker
   itself is bug-fixed and produces a clean (if drifting) trajectory.
+
+### Loop-closure classifier: real-label retraining
+
+`src/cnn_loop_closure.py` / `src/random_forest_loop_closure.py` originally
+trained their Random Forest classifier on synthetic Gaussian feature
+vectors with labels from a hand-written heuristic formula — it never saw a
+real loop closure. This has been addressed:
+
+- `evaluation/retrain_loop_closure_real_labels.py` builds a **real**
+  labeled dataset directly from TUM RGB-D ground truth: positive pairs are
+  frames whose ground-truth camera positions are spatially close
+  (< 0.08 m) but temporally separated by > 5 s (a genuine revisit);
+  negative pairs are spatially far apart (> 0.5 m). SIFT-based match
+  features are extracted for each real pair and a Random Forest is
+  trained on this real signal.
+  - Note: the CNN (ResNet18) similarity feature from the original pipeline
+    is **not** included — PyTorch could not be installed in this
+    environment (disk constraints). The retrained classifier uses the
+    remaining 8 classical SIFT-based features. Documented simplification,
+    not a silent omission.
+
+- **Head-to-head result (same held-out real test set, 145 pairs):**
+
+  | Model | Accuracy | ROC-AUC | Loop-closure recall |
+  |---|---|---|---|
+  | Original (synthetic-trained) | 0.324 | 0.977 | 0.02 |
+  | Retrained (real-labeled) | 1.000 | 1.000 | 1.00 |
+
+  The synthetic-trained model has a *reasonable* AUC (its features carry
+  some real signal) but is **badly miscalibrated**: at its default
+  decision threshold it misses 98% of genuine loop closures. Training on
+  real, ground-truth-derived labels fixes this.
+
+- **Honest caveat on the 1.00/1.00 result:** the positive/negative distance
+  thresholds (0.08 m vs 0.5 m) leave a wide margin, which makes this
+  particular test split easy to separate — a strong result here is not
+  proof of robustness on harder, near-threshold cases. A follow-up should
+  narrow that margin (e.g. hard-negative mining just outside 0.08 m) for a
+  more demanding evaluation.
+
+- Artifacts: `results/rf_loop_closure_REAL_labels.joblib`,
+  `results/rf_scaler_REAL_labels.joblib`, `results/real_label_eval.npz`.
 
 ## Repository layout
 
@@ -80,14 +115,18 @@ vision_system/
 │   ├── tracking.py                   # Feature tracking + pose estimation (RANSAC-PnP fix applied)
 │   ├── mapping.py                    # Basic mapping
 │   ├── run_slam.py                   # Interactive runner (webcam/video/image seq)
-│   ├── cnn_loop_closure.py           # CNN+RF loop closure — UNVALIDATED, see above
+│   ├── cnn_loop_closure.py           # CNN+RF loop closure (original, synthetic-trained)
 │   └── random_forest_loop_closure.py
 ├── evaluation/
-│   └── evaluate_tum.py               # Headless TUM RGB-D evaluator (source of the numbers above)
+│   ├── evaluate_tum.py                        # Headless TUM RGB-D VO evaluator
+│   └── retrain_loop_closure_real_labels.py    # Real-label loop-closure retraining + eval
 ├── config/
 │   └── camera_config.yaml
 ├── results/
-│   └── tum_eval.npz                  # Raw arrays from the last verified evaluation run
+│   ├── tum_eval.npz                           # VO evaluation results
+│   ├── rf_loop_closure_REAL_labels.joblib     # Real-labeled classifier
+│   ├── rf_scaler_REAL_labels.joblib
+│   └── real_label_eval.npz                    # Real-label test set + predictions
 ├── docs/                             # Background literature / notes
 └── data/                             # (not checked in — see Data section)
 ```
@@ -103,8 +142,9 @@ and place under `data/rgbd_dataset_freiburg1_xyz/`.
 
 ```bash
 python -m venv venv && source venv/bin/activate
-pip install opencv-python-headless numpy scipy matplotlib PyYAML
-python evaluation/evaluate_tum.py
+pip install opencv-python-headless numpy scipy matplotlib PyYAML scikit-learn joblib
+python evaluation/evaluate_tum.py                          # VO/tracking evaluation
+python evaluation/retrain_loop_closure_real_labels.py       # Loop-closure retraining + eval
 ```
 
 ## Next steps (tracked honestly, not yet done)
@@ -112,7 +152,11 @@ python evaluation/evaluate_tum.py
 1. Implement pose-graph optimization / loop-closure correction to address
    the residual ~10x drift documented above (the tracker itself is now
    bug-fixed; this is the remaining structural gap).
-2. Re-label a real loop-closure training set from recorded video and
-   retrain the RF classifier on real (not synthetic) labels.
-3. Compare before/after loop-closure integration as a quantitative result
-   (this is the strongest candidate for the paper's core empirical section).
+2. Harden the real-label loop-closure evaluation with hard negatives near
+   the 0.08 m boundary, to get a less trivially-separable benchmark.
+3. Re-add the CNN (ResNet18) similarity feature once a PyTorch install is
+   available, and re-run the real-vs-synthetic comparison with it included.
+4. Wire the retrained real-label classifier into the main SLAM loop as an
+   actual loop-closure trigger, then correct the drifting trajectory and
+   re-measure ATE — this is the strongest candidate for the paper's core
+   empirical result (failure mode → fix → quantitative before/after).
