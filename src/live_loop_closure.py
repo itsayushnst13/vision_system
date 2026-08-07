@@ -1,6 +1,12 @@
 """
-Loop Closure Detector
-======================
+Live Loop Closure Detector
+===========================
+NOTE: named LiveLoopClosureDetector (in live_loop_closure.py) to avoid
+colliding with the pre-existing LoopClosureDetector class that
+random_forest_loop_closure.py / cnn_loop_closure.py inherit from. An
+earlier version of this file was called loop_closure_detector.py and
+shadowed that module on sys.path, silently breaking those two originals.
+
 Wraps the real-labeled Random Forest classifier (trained in
 evaluation/retrain_loop_closure_real_labels.py) for use inside the live
 SLAM tracking loop.
@@ -14,7 +20,7 @@ import cv2
 import joblib
 
 
-class LoopClosureDetector:
+class LiveLoopClosureDetector:
     def __init__(self, model_path: str, scaler_path: str, threshold: float = 0.5):
         if not os.path.exists(model_path) or not os.path.exists(scaler_path):
             raise FileNotFoundError(
@@ -34,7 +40,9 @@ class LoopClosureDetector:
             return None
 
         raw = self.matcher.knnMatch(des1.astype(np.float32), des2.astype(np.float32), k=2)
-        matches = [m for m, n in raw if m.distance < 0.7 * n.distance] if raw else []
+        # Guard each pair: knnMatch can return fewer than 2 neighbours for a
+        # query point, which would make tuple-unpacking `for m, n in raw` crash.
+        matches = [p[0] for p in raw if len(p) == 2 and p[0].distance < 0.7 * p[1].distance]
         if not matches or len(matches) < 2:
             return None
 

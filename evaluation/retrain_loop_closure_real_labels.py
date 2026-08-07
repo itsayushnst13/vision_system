@@ -37,8 +37,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, accuracy_score, roc_auc_score
 
-DATASET = os.path.join(os.path.dirname(__file__), "..", "..",
-                        "Loop_Closure_and_Algorithms", "data", "rgbd_dataset_freiburg1_xyz")
+DATASET = os.path.join(os.path.dirname(__file__), "..", "data", "rgbd_dataset_freiburg1_xyz")
 POS_THRESH = 0.08     # meters -- "same place" (true revisit)
 HARD_NEG_MIN = 0.12   # meters -- start of the ambiguous "nearby but different" zone
 HARD_NEG_MAX = 0.35   # meters -- end of that zone
@@ -86,7 +85,9 @@ def extract_sift_features(img1_path, img2_path, sift, matcher):
         return np.zeros(8)
 
     raw = matcher.knnMatch(des1.astype(np.float32), des2.astype(np.float32), k=2)
-    matches = [m for m, n in raw if len(raw) and m.distance < 0.7 * n.distance] if raw and len(raw[0]) == 2 else []
+    # Guard each pair: knnMatch may return fewer than 2 neighbours for a
+    # query, which would crash tuple-unpacking `for m, n in raw`.
+    matches = [p[0] for p in raw if len(p) == 2 and p[0].distance < 0.7 * p[1].distance]
 
     if not matches or len(matches) < 2:
         return np.zeros(8)

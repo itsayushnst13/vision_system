@@ -68,12 +68,23 @@ def visualize_trajectory_3d(trajectory, save_path='trajectory_3d.html'):
 def process_rgbd_dataset(rgb_path, depth_path, config_path):
     """
     Process RGB-D dataset
-    
+
     Args:
         rgb_path: Directory containing RGB images
         depth_path: Directory containing depth images
         config_path: Path to camera configuration file
+
+    NOTE: this pairs RGB and depth frames by sorted-filename index. That is
+    only correct for datasets where RGB[i] and depth[i] are already aligned.
+    For TUM RGB-D, RGB and depth streams have independent timestamps and must
+    be associated by nearest timestamp -- see evaluation/evaluate_tum.py's
+    associate() for the correct approach. This demo entry point assumes
+    pre-aligned frames.
     """
+    import yaml
+    with open(config_path) as f:
+        depth_scale = yaml.safe_load(f)["Camera"].get("depth_scale", 5000.0)
+
     # Get sorted lists of RGB and depth images
     rgb_files = sorted(glob(os.path.join(rgb_path, '*.png')))
     depth_files = sorted(glob(os.path.join(depth_path, '*.png')))
@@ -107,8 +118,10 @@ def process_rgbd_dataset(rgb_path, depth_path, config_path):
             print(f"\nFailed to read frame {i}")
             continue
         
-        # Convert depth to meters (assuming depth is in millimeters)
-        depth = depth.astype(float) / 1000.0
+        # Convert raw depth to meters using the dataset's depth scale from
+        # config (TUM RGB-D uses 5000, NOT 1000 -- the previous hard-coded
+        # /1000.0 made every depth 5x too large, corrupting metric scale).
+        depth = depth.astype(float) / depth_scale
         
         # Process frame
         pose, keypoints = slam.process_frame(rgb, depth)

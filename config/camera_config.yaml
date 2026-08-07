@@ -1,4 +1,4 @@
-# KITTI Camera Parameters (real-world sequence)
+# TUM RGB-D fr1/xyz Camera Parameters (real-world sequence)
 Camera:
   # TUM RGB-D fr1/xyz camera parameters
   fx: 517.3  # focal length x
@@ -25,16 +25,18 @@ Camera:
   # Frame rate
   fps: 10
   
-# ORB Parameters (tuned for urban environments)
+# ORB Parameters
+# NOTE: these are the values that produced the documented TUM baseline
+# (ATE 0.235m aligned). system.py reads this section directly.
 ORB:
-  nfeatures: 4000  # More features for robust tracking
+  nfeatures: 2000
   scale_factor: 1.2
   nlevels: 8
-  edge_threshold: 31  # Larger threshold for better feature distribution
+  edge_threshold: 19
   first_level: 0
   WTA_K: 2
   patch_size: 31
-  fast_threshold: 12  # Lower threshold to detect more features
+  fast_threshold: 20
   
 # Loop Closure Parameters
 LoopClosure:

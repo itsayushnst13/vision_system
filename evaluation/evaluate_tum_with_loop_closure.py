@@ -10,8 +10,7 @@ import numpy as np
 import cv2
 from system import ORBSlam3
 
-DATASET = os.path.join(os.path.dirname(__file__), "..", "..",
-                        "Loop_Closure_and_Algorithms", "data", "rgbd_dataset_freiburg1_xyz")
+DATASET = os.path.join(os.path.dirname(__file__), "..", "data", "rgbd_dataset_freiburg1_xyz")
 CONFIG = os.path.join(os.path.dirname(__file__), "..", "config", "camera_config.yaml")
 DEPTH_SCALE = 5000.0
 MAX_FRAMES = 120
@@ -72,20 +71,32 @@ def run_pipeline(matched, enable_loop_closure):
         if frame is None or depth_raw is None:
             continue
         depth = depth_raw.astype(np.float32) / DEPTH_SCALE
+
+        # Only pair a ground-truth entry with a frame when the SLAM system
+        # actually appended a new pose. process_frame() returns the previous
+        # pose (not None) when tracking fails mid-sequence without appending
+        # to slam.trajectory, so keying off the return value alone would
+        # desynchronise est_traj from slam.trajectory and from gt_traj.
+        n_before = len(slam.trajectory)
         pose, kps = slam.process_frame(frame, depth)
-        if pose is not None:
-            est_traj.append(pose[:3, 3].copy())
+        if len(slam.trajectory) > n_before:
+            est_traj.append(slam.trajectory[-1][:3, 3].copy())
             gt_traj.append(gt_entry[1:4])
+
         if (i + 1) % 50 == 0:
             print(f"  [{'loop-closure ON' if enable_loop_closure else 'loop-closure OFF'}] "
                   f"{i+1}/{len(matched)} frames, {len(slam.loop_pairs)} loop closures found")
 
     if enable_loop_closure:
         slam.flush_loop_closures()
-        # Re-read corrected trajectory positions
+        # Re-read corrected trajectory positions. Lengths are guaranteed to
+        # match gt_traj by the append logic above.
         est_traj = [p[:3, 3].copy() for p in slam.trajectory]
 
-    return np.array(est_traj), np.array(gt_traj), len(slam.loop_pairs)
+    est_arr, gt_arr = np.array(est_traj), np.array(gt_traj)
+    assert len(est_arr) == len(gt_arr), (
+        f"est/gt length mismatch: {len(est_arr)} vs {len(gt_arr)}")
+    return est_arr, gt_arr, len(slam.loop_pairs)
 
 
 def evaluate(est_xyz, gt_xyz, label):

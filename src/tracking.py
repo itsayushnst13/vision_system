@@ -76,8 +76,15 @@ class Tracker:
             return self.prev_pose
         
         # Match features
+        if self.prev_descriptors is None or descriptors is None:
+            print("\nNo descriptors to match")
+            return None
         matches = self.matcher.match(self.prev_descriptors, descriptors)
-        
+
+        if len(matches) == 0:
+            print("\nNo feature matches")
+            return None
+
         # Filter matches by distance
         max_dist = max(m.distance for m in matches)
         good_matches = [m for m in matches if m.distance < 0.7 * max_dist]
@@ -102,8 +109,14 @@ class Tracker:
                     # Not enough valid 3D points, fallback to essential matrix method
                     use_pnp = False
                 else:
-                    prev_3d_pts = prev_3d_pts[valid_mask]
-                    curr_pts = curr_pts[valid_mask]
+                    # NOTE: use SEPARATE filtered arrays here. Previously
+                    # `curr_pts` itself was reassigned to curr_pts[valid_mask];
+                    # if PnP was then attempted but failed, the essential-matrix
+                    # fallback received a filtered curr_pts but a full-length
+                    # prev_pts -> mismatched array lengths -> crash. Keep the
+                    # originals intact for the fallback path.
+                    prev_3d_pts_valid = prev_3d_pts[valid_mask]
+                    curr_pts_valid = curr_pts[valid_mask]
                     use_pnp = True
                 
                 if use_pnp:
@@ -112,8 +125,8 @@ class Tracker:
                     # correspondence can produce a wild pose estimate that then
                     # propagates through the whole chained trajectory.)
                     success, rvec, tvec, inliers = cv2.solvePnPRansac(
-                        prev_3d_pts,
-                        curr_pts,
+                        prev_3d_pts_valid,
+                        curr_pts_valid,
                         self.camera_matrix,
                         self.dist_coeffs,
                         flags=cv2.SOLVEPNP_ITERATIVE,
@@ -182,12 +195,20 @@ class Tracker:
                 # step size instead.
                 current_norm = np.linalg.norm(t_inv)
                 if current_norm > 1e-9 and self.recent_scales:
+                    # We have a metric (PnP-derived) scale reference from
+                    # earlier RGB-D frames -> rescale the unit direction to it.
                     t_inv = t_inv / current_norm * self.median_scale
-                elif current_norm > 1e-9:
-                    # No PnP scale reference yet (e.g. very start of
-                    # sequence) — better to assume no motion than to inject
-                    # an arbitrary unit-scale jump.
+                elif current_norm > 1e-9 and depth is not None:
+                    # RGB-D mode but no metric scale reference yet (e.g. the
+                    # very start of the sequence, all frames so far fell back):
+                    # better to assume no motion than to inject an arbitrary
+                    # unit-scale jump into a would-be-metric trajectory.
                     t_inv = np.zeros(3)
+                # else: pure monocular mode (depth is None, no metric reference
+                # possible) -- keep the unit-scale essential-matrix translation
+                # as-is. Monocular SLAM is inherently scale-ambiguous, so an
+                # arbitrary consistent unit scale is the correct best effort;
+                # zeroing it would freeze the trajectory at the origin.
 
             # Create transformation matrix (previous_from_current)
             transform = np.eye(4)
@@ -209,56 +230,6 @@ class Tracker:
         except Exception as e:
             print(f"\nTracking failed: {str(e)}")
             return None
-        
-    def _estimate_scale(self, t: np.ndarray, curr_pts: np.ndarray, prev_pts: np.ndarray) -> float:
-        """
-        Estimate scale from matched points and translation.
-        
-        Args:
-            t: Translation vector (3,1)
-            curr_pts: Current frame points (N,2)
-            prev_pts: Previous frame points (N,2)
-            
-        Returns:
-            float: Estimated scale
-        """
-        # Compute point motion in image plane
-        motion_vectors = curr_pts - prev_pts  # Shape: (N,2)
-        motion_magnitudes = np.linalg.norm(motion_vectors, axis=1)  # Shape: (N,)
-        
-        # Convert motion vectors to 3D direction (assuming normalized image plane)
-        motion_vectors_3d = np.column_stack([
-            (curr_pts[:, 0] - self.camera_matrix[0, 2]) / self.camera_matrix[0, 0],
-            (curr_pts[:, 1] - self.camera_matrix[1, 2]) / self.camera_matrix[1, 1],
-            np.ones(len(curr_pts))
-        ])
-        prev_vectors_3d = np.column_stack([
-            (prev_pts[:, 0] - self.camera_matrix[0, 2]) / self.camera_matrix[0, 0],
-            (prev_pts[:, 1] - self.camera_matrix[1, 2]) / self.camera_matrix[1, 1],
-            np.ones(len(prev_pts))
-        ])
-        
-        # Normalize 3D vectors
-        motion_vectors_3d = motion_vectors_3d / np.linalg.norm(motion_vectors_3d, axis=1)[:, np.newaxis]
-        prev_vectors_3d = prev_vectors_3d / np.linalg.norm(prev_vectors_3d, axis=1)[:, np.newaxis]
-        
-        # Get translation direction
-        t_dir = t.ravel() / np.linalg.norm(t)  # Shape: (3,)
-        
-        # Project motion vectors onto translation direction
-        projected_motions = []
-        for motion_mag, motion_3d, prev_3d in zip(motion_magnitudes, motion_vectors_3d, prev_vectors_3d):
-            if motion_mag > 0:  # Only consider non-zero motions
-                # Compute angle between motion and translation
-                motion_alignment = np.abs(np.dot(motion_3d - prev_3d, t_dir))
-                if motion_alignment > 0.7:  # Only consider motions aligned with translation
-                    projected_motions.append(motion_mag)
-        
-        if len(projected_motions) < 10:  # Need enough samples for reliable scale
-            return self.median_scale if self.median_scale is not None else 1.0
-            
-        # Use median of projected motions for robustness
-        return np.median(projected_motions)
         
     def _compute_3d_points(self, keypoints: List, depth: np.ndarray) -> np.ndarray:
         """

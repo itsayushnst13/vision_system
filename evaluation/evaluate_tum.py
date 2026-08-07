@@ -71,7 +71,10 @@ def main():
         matched = matched[::step]
         print(f"Subsampled to {len(matched)} frames (every {step}th frame)")
 
-    slam = ORBSlam3(CONFIG)
+    # Pure VO/tracking benchmark -- disable loop closure so this measures
+    # the tracker in isolation (evaluate_tum_with_loop_closure.py is the
+    # script that exercises loop closure on/off).
+    slam = ORBSlam3(CONFIG, enable_loop_closure=False)
     if not slam.initialize():
         print("Failed to initialize SLAM")
         return

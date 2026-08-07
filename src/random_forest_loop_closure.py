@@ -1,3 +1,23 @@
+"""
+LEGACY / NON-FUNCTIONAL IN THIS REPO -- see note below.
+
+This module inherits from a `LoopClosureDetector` base class that lived in
+`loop_closure_detector.py` in the ORIGINAL standalone Loop_Closure
+repository. That base-class file was never merged in when the four original
+repos were consolidated into vision_system, so the import on the next line
+fails and this module cannot currently be used.
+
+It is kept in the repo as the historical reference implementation of the
+synthetic-label classifier whose failure is analysed in the README
+(32% accuracy / 2% recall on real data).
+
+The WORKING, real-label replacement that is actually wired into the live
+SLAM pipeline is `src/live_loop_closure.py` (class LiveLoopClosureDetector),
+trained by `evaluation/retrain_loop_closure_real_labels.py`.
+
+To revive this module, restore the original `loop_closure_detector.py` base
+class from the Loop_Closure repository.
+"""
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler

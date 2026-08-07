@@ -1,3 +1,22 @@
+"""
+LEGACY / NON-FUNCTIONAL IN THIS REPO -- see note below.
+
+Two reasons this module cannot currently run:
+  1. It inherits (via random_forest_loop_closure.py) from a
+     `LoopClosureDetector` base class in `loop_closure_detector.py`, which
+     lived in the original standalone Loop_Closure repository and was never
+     merged in during consolidation.
+  2. It requires PyTorch (ResNet18 feature extractor), which is not
+     installed in the evaluation environment used for this repo's results.
+
+It is kept as the historical reference implementation of the CNN+RF
+synthetic-label classifier analysed in the README.
+
+The WORKING, real-label replacement wired into the live SLAM pipeline is
+`src/live_loop_closure.py` (class LiveLoopClosureDetector). Note that the
+retrained classifier omits the CNN similarity feature for reason (2) --
+this is documented, not silently dropped.
+"""
 import torch
 import torch.nn as nn
 import torchvision.models as models

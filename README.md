@@ -104,30 +104,58 @@ produces many more false positives than true positives in absolute
 deployment terms, because true loop closures are rare relative to the
 number of candidate pairs actually queried.
 
-**Safety guard (implemented, and this is the part that's actually
-production-safe right now).** Rather than trust every classifier
-"loop closure" and risk pose-graph divergence, `src/system.py` now
-sanity-checks every proposed correction in `pose_graph_optimizer.py`:
-if applying it would move any keyframe further than ~10x the trajectory's
-own spatial extent, the correction is rejected outright and the
-trajectory is left uncorrected. Re-running the v2b classifier live with
-this guard in place: **all 16 flagged loop closures were correctly
-rejected as destabilizing**, and the trajectory matched the
-loop-closure-disabled baseline exactly (ATE 0.6517m unaligned, both
-runs) — no corruption, but also no measured improvement yet, because this
-particular short sequence didn't happen to contain a loop closure the
-classifier got right without also raising false positives.
+**Root-cause fix: the pose graph was rank-deficient.** The first live
+integration attempt produced absurd corrections (proposed keyframe shifts of
+hundreds of metres on a ~2 m trajectory), which was initially attributed
+entirely to classifier false positives. That was only half the story. The
+pose-graph objective in `pose_graph_optimizer.py` consisted solely of
+odometry residuals (which constrain *relative* positions) and loop-closure
+residuals (which constrain *differences* between positions). Both are
+invariant to translating the entire trajectory by any constant vector — a
+3-DOF gauge freedom leaving the problem rank-deficient, so the solver could
+wander arbitrarily far along the null space while barely changing the cost.
+Adding an **anchor residual** pinning the first keyframe to its original
+position removes the null space and makes the solve well-posed. (The solver
+was also switched from `lm` to `trf`, and the residual construction
+vectorized for speed.)
 
-- **Where this honestly stands:** the classifier is not yet reliable
-  enough to trust blindly, but the system is now safe to run with loop
-  closure enabled — it degrades gracefully to the uncorrected baseline
-  rather than corrupting the trajectory. This is a real, deployable
-  improvement over where the code started (no keyframe storage at all,
-  synthetic-only training, and no safety check).
-- **Concrete next step to get an actual accuracy improvement (not just
-  safety):** calibrate the decision threshold for the true deployment
-  base rate (few true positives per many queries) rather than the
-  balanced-training default, and/or require N-consecutive-frame
+**Safety guard.** Independently of the above, `src/system.py` sanity-checks
+every proposed correction: if applying it would move any keyframe further
+than ~10x the trajectory's own spatial extent, the correction is rejected
+and the trajectory is left uncorrected. Before the anchor fix this guard was
+firing on every single correction (rejecting all of them, which is what kept
+the trajectory merely uncorrected rather than corrupted). After the anchor
+fix it fires zero times — the corrections are now well-scaled and are
+accepted. The guard is retained as defence-in-depth.
+
+**Live loop-closure result (TUM RGB-D freiburg1_xyz, 133 frames):**
+
+| | Loop closure OFF | Loop closure ON |
+|---|---|---|
+| ATE RMSE, unaligned | 0.6517 m | **0.3029 m** |
+| ATE RMSE, Sim(3)-aligned | 0.2212 m | **0.2032 m** |
+| Corrections rejected by guard | — | 0 |
+
+Closing loops cuts raw (unaligned) trajectory drift by **53.5%**. The
+Sim(3)-aligned improvement is smaller (8%) as expected: much of what loop
+closure fixes is exactly the accumulated scale/position drift that a
+post-hoc similarity alignment already partially absorbs.
+
+- **Honest caveats on this result:**
+  - 16 loop closures were flagged over 133 frames, and the base-rate
+    analysis above says most are likely false positives. The trajectory
+    still improves substantially, because the pose-graph relaxation is
+    dominated by odometry residuals and a wrong "these two keyframes
+    coincide" constraint between two genuinely-nearby keyframes is a mild
+    error, not a catastrophic one — but this is *tolerating* false
+    positives, not being correct about them.
+  - The pose graph corrects **translation only**; rotation is left as the
+    tracker estimated it.
+  - This is one sequence. It is a real measured before/after, not a
+    projection, but it is not yet evidence of generality.
+- **Concrete next steps:** calibrate the decision threshold for the true
+  deployment base rate (few true positives per many queries) rather than
+  the balanced-training default, and/or require N-consecutive-frame
   consistency before accepting a candidate loop closure — standard
   practice in production SLAM systems, not yet implemented here.
 - Artifacts: `results/rf_loop_closure_REAL_labels.joblib` (current, v2b,
@@ -142,12 +170,12 @@ vision_system/
 ├── src/
 │   ├── system.py                     # Main SLAM system (ORBSlam3 class) -- now with keyframe storage + loop closure wiring
 │   ├── tracking.py                   # Feature tracking + pose estimation (RANSAC-PnP fix applied)
-│   ├── mapping.py                    # Basic mapping
+│   ├── mapping.py                    # Mapper class -- STUB, not wired into system.py
 │   ├── run_slam.py                   # Interactive runner (webcam/video/image seq)
-│   ├── loop_closure_detector.py      # Wraps trained classifier for live use (NEW)
+│   ├── live_loop_closure.py          # Wraps trained classifier for live use (NEW)
 │   ├── pose_graph_optimizer.py       # Lightweight scipy pose-graph correction + safety guard (NEW)
-│   ├── cnn_loop_closure.py           # CNN+RF loop closure (original, synthetic-trained)
-│   └── random_forest_loop_closure.py
+│   ├── cnn_loop_closure.py           # LEGACY, non-functional -- see note in file
+│   └── random_forest_loop_closure.py # LEGACY, non-functional -- see note in file
 ├── evaluation/
 │   ├── evaluate_tum.py                        # Headless TUM RGB-D VO evaluator
 │   ├── retrain_loop_closure_real_labels.py    # Real-label loop-closure retraining + eval
@@ -189,12 +217,16 @@ python evaluation/evaluate_tum_with_loop_closure.py         # Live loop-closure 
 2. Require N-consecutive-frame consistency before accepting a candidate
    loop closure (standard production-SLAM practice), instead of acting on
    a single frame's classification.
-3. Re-add the CNN (ResNet18) similarity feature once a PyTorch install is
+3. Extend the pose-graph optimizer to correct rotation, not just
+   translation.
+4. Re-add the CNN (ResNet18) similarity feature once a PyTorch install is
    available, and re-run the real-vs-synthetic comparison with it included.
-4. Extend the pose-graph optimizer to correct rotation, not just
-   translation, once (1) and (2) make loop closures trustworthy enough to
-   actually accept.
-5. Find or construct a longer sequence with a genuine, unambiguous loop
-   closure to demonstrate a real before/after ATE improvement -- the
-   current freiburg1_xyz subset used here doesn't contain one that this
-   classifier can isolate cleanly from the false positives.
+5. Validate the +53.5% loop-closure result on additional sequences -- one
+   sequence is a real measurement but not evidence of generality.
+6. Either restore the missing `loop_closure_detector.py` base class from
+   the original Loop_Closure repo to revive the two legacy modules, or
+   delete them once the README's failure analysis no longer needs them as
+   reference.
+7. Implement or remove `src/mapping.py` -- its `Mapper` class is a stub
+   (`_triangulate_new_points` and `_local_bundle_adjustment` are `pass`)
+   and nothing in the pipeline instantiates it.

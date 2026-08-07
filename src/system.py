@@ -7,7 +7,7 @@ from tracking import Tracker
 from pose_graph_optimizer import PoseGraphOptimizer
 
 try:
-    from loop_closure_detector import LoopClosureDetector
+    from live_loop_closure import LiveLoopClosureDetector
     _HAS_LOOP_CLOSURE_MODULE = True
 except ImportError:
     _HAS_LOOP_CLOSURE_MODULE = False
@@ -90,6 +90,22 @@ class ORBSlam3:
             camera_config['k3']
         ])
 
+        # ORB parameters -- read from config so the config's ORB section is
+        # actually honored. Previously these were hard-coded in initialize(),
+        # so tuning the config had no effect. Fall back to sensible defaults
+        # if the section or a key is missing.
+        orb_cfg = config.get('ORB', {})
+        self.orb_params = {
+            'nfeatures': orb_cfg.get('nfeatures', 2000),
+            'scaleFactor': orb_cfg.get('scale_factor', 1.2),
+            'nlevels': orb_cfg.get('nlevels', 8),
+            'edgeThreshold': orb_cfg.get('edge_threshold', 19),
+            'firstLevel': orb_cfg.get('first_level', 0),
+            'WTA_K': orb_cfg.get('WTA_K', 2),
+            'patchSize': orb_cfg.get('patch_size', 31),
+            'fastThreshold': orb_cfg.get('fast_threshold', 20),
+        }
+
     def initialize(self) -> bool:
         """
         Initialize all SLAM system components.
@@ -98,17 +114,17 @@ class ORBSlam3:
             bool: True if initialization successful, False otherwise
         """
         try:
-            # Initialize feature extraction
+            # Initialize feature extraction (parameters from config)
             self.feature_extractor = cv2.ORB_create(
-                nfeatures=2000,
-                scaleFactor=1.2,
-                nlevels=8,
-                edgeThreshold=19,
-                firstLevel=0,
-                WTA_K=2,
+                nfeatures=self.orb_params['nfeatures'],
+                scaleFactor=self.orb_params['scaleFactor'],
+                nlevels=self.orb_params['nlevels'],
+                edgeThreshold=self.orb_params['edgeThreshold'],
+                firstLevel=self.orb_params['firstLevel'],
+                WTA_K=self.orb_params['WTA_K'],
                 scoreType=cv2.ORB_HARRIS_SCORE,
-                patchSize=31,
-                fastThreshold=20
+                patchSize=self.orb_params['patchSize'],
+                fastThreshold=self.orb_params['fastThreshold']
             )
             
             # Initialize tracker
@@ -121,7 +137,7 @@ class ORBSlam3:
                 scaler_path = os.path.join(os.path.dirname(__file__), "..", "results",
                                             "rf_scaler_REAL_labels.joblib")
                 try:
-                    self.loop_detector = LoopClosureDetector(model_path, scaler_path)
+                    self.loop_detector = LiveLoopClosureDetector(model_path, scaler_path)
                     print("Loop closure detector loaded (real-labeled classifier).")
                 except FileNotFoundError as e:
                     print(f"Loop closure disabled: {e}")
