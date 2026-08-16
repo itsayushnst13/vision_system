@@ -55,6 +55,8 @@ class ORBSlam3:
         self.enable_loop_closure = enable_loop_closure
         self.loop_detector = None
         self.loop_pairs: List[Tuple[int, int]] = []  # (keyframe_idx_i, keyframe_idx_j)
+        self.loop_measurements: List[np.ndarray] = []  # world-frame translation per pair
+        self.n_appearance_candidates = 0  # before geometric verification
         self.loop_check_min_keyframe_gap = 15  # only check keyframes this far apart
         self.loop_confidence_threshold = 0.9   # stricter than the classifier's own 0.5
                                                 # default -- see README: the real-labeled
@@ -106,6 +108,11 @@ class ORBSlam3:
             'fastThreshold': orb_cfg.get('fast_threshold', 20),
         }
 
+        # Tracking and LoopClosure sections: previously present in the YAML but
+        # read by nothing, so editing them had no effect whatsoever.
+        self.tracking_params = config.get('Tracking', {}) or {}
+        self.loop_params = config.get('LoopClosure', {}) or {}
+
     def initialize(self) -> bool:
         """
         Initialize all SLAM system components.
@@ -127,8 +134,10 @@ class ORBSlam3:
                 fastThreshold=self.orb_params['fastThreshold']
             )
             
-            # Initialize tracker
-            self.tracker = Tracker(self.camera_matrix, self.dist_coeffs)
+            # Initialize tracker (Tracking section of the config is now
+            # actually passed through; it was previously ignored entirely)
+            self.tracker = Tracker(self.camera_matrix, self.dist_coeffs,
+                                   tracking_cfg=self.tracking_params)
 
             # Initialize loop closure detector (optional, graceful degradation)
             if self.enable_loop_closure and _HAS_LOOP_CLOSURE_MODULE:
@@ -137,7 +146,12 @@ class ORBSlam3:
                 scaler_path = os.path.join(os.path.dirname(__file__), "..", "results",
                                             "rf_scaler_REAL_labels.joblib")
                 try:
-                    self.loop_detector = LiveLoopClosureDetector(model_path, scaler_path)
+                    self.loop_detector = LiveLoopClosureDetector(
+                        model_path, scaler_path,
+                        threshold=self.loop_params.get('appearanceThreshold', 0.9),
+                        camera_matrix=self.camera_matrix,
+                        dist_coeffs=self.dist_coeffs,
+                        min_geometric_inliers=self.loop_params.get('minGeometricInliers', 25))
                     print("Loop closure detector loaded (real-labeled classifier).")
                 except FileNotFoundError as e:
                     print(f"Loop closure disabled: {e}")
@@ -229,25 +243,21 @@ class ORBSlam3:
             pose: Camera pose
             depth: Optional depth image (in meters)
         """
-        # Triangulate 3D points
-        points_3d = np.zeros((len(keypoints), 3))
-        
-        if depth is not None:
-            # Use depth information when available
-            for i, kp in enumerate(keypoints):
-                x, y = map(int, kp.pt)
-                if 0 <= y < depth.shape[0] and 0 <= x < depth.shape[1]:
-                    z = depth[y, x]
-                    if z > 0:  # Valid depth
-                        # Back-project to 3D using depth
-                        x_3d = (x - self.camera_matrix[0, 2]) * z / self.camera_matrix[0, 0]
-                        y_3d = (y - self.camera_matrix[1, 2]) * z / self.camera_matrix[1, 1]
-                        points_3d[i] = [x_3d, y_3d, z]
+        # Back-project keypoints to 3D. This delegates to the tracker's shared
+        # helper rather than reimplementing the maths: the duplicate copy that
+        # used to live here had the same distortion bug (pinhole back-projection
+        # applied to raw distorted pixels) and the same single-pixel depth
+        # lookup, so keyframe 3D points disagreed with tracking 3D points for
+        # the identical keypoint.
+        if depth is not None and self.tracker is not None:
+            points_3d = self.tracker.compute_3d_points(keypoints, depth)
         else:
-            # Fallback to simple projection when no depth available
-            for i, kp in enumerate(keypoints):
-                pt = np.array([kp.pt[0], kp.pt[1], 1.0])
-                points_3d[i] = (np.linalg.inv(pose)[:3, :3] @ pt) + pose[:3, 3]
+            # Without depth there is no metric 3D structure from a single
+            # frame. Store zeros (the established "invalid" convention here)
+            # rather than the previous placeholder, which multiplied a
+            # homogeneous pixel vector by a rotation matrix and produced a
+            # quantity with no geometric meaning.
+            points_3d = np.zeros((len(keypoints), 3))
 
         # Store the keyframe -- previously this method computed points_3d and
         # discarded it without ever appending to self.keyframes, so
@@ -255,6 +265,9 @@ class ORBSlam3:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
         self.keyframes.append({
             "image_gray": gray,
+            # Depth is retained because geometric verification of a loop
+            # closure needs the OLDER keyframe's depth map to build 3D points.
+            "depth": None if depth is None else depth.copy(),
             "pose": pose.copy(),
             "trajectory_index": len(self.trajectory) - 1,  # index into self.trajectory
             "points_3d": points_3d,
@@ -285,9 +298,29 @@ class ORBSlam3:
                 if conf > self.loop_confidence_threshold and conf > best_conf:
                     best_j, best_conf = j, conf
             if best_j is not None:
-                print(f"Loop closure detected: keyframe {best_j} <-> {new_idx} "
-                      f"(confidence={best_conf:.3f})")
-                self.loop_pairs.append((best_j, new_idx))
+                # STAGE 2 -- geometric verification. Appearance alone is not
+                # enough: at run time nearly every queried candidate is a true
+                # negative, so even good balanced precision yields far more
+                # false positives than true positives in absolute terms. A PnP
+                # consensus test rejects appearance matches that admit no
+                # consistent rigid motion, and it produces the relative
+                # translation the pose graph requires as an edge measurement.
+                self.n_appearance_candidates += 1
+                accepted, delta_world, n_inl = self.loop_detector.verify(
+                    self.keyframes[best_j]["image_gray"], gray,
+                    self.keyframes[best_j]["depth"],
+                    self.keyframes[best_j]["pose"],
+                    depth_min=self.tracking_params.get("depthMin", 0.5),
+                    depth_max=self.tracking_params.get("depthMax", 5.0),
+                )
+                if not accepted:
+                    print(f"Loop candidate {best_j} <-> {new_idx} "
+                          f"(conf={best_conf:.3f}) REJECTED by geometric verification")
+                else:
+                    print(f"Loop closure accepted: keyframe {best_j} <-> {new_idx} "
+                          f"(conf={best_conf:.3f}, {n_inl} geometric inliers)")
+                    self.loop_pairs.append((best_j, new_idx))
+                    self.loop_measurements.append(delta_world)
                 # Re-optimizing on every single detection is expensive
                 # (O(n) least-squares solve each time); batch corrections
                 # instead of triggering one per detection.
@@ -309,7 +342,8 @@ class ORBSlam3:
             return
 
         kf_positions = np.array([kf["pose"][:3, 3] for kf in self.keyframes])
-        corrected = self.pose_graph_optimizer.optimize(kf_positions, self.loop_pairs)
+        corrected = self.pose_graph_optimizer.optimize(
+            kf_positions, self.loop_pairs, self.loop_measurements)
 
         # Safety guard: a genuinely mistaken loop-closure constraint (false
         # positive) can make the least-squares solve diverge wildly. Reject

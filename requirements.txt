@@ -1,5 +1,6 @@
 # Core dependencies for the SLAM pipeline and all evaluations.
-# Versions are the ones the reported results were produced with.
+# Lower bounds are the versions the reported results were produced with; the
+# previous file claimed to pin exact versions but used >= throughout.
 opencv-python-headless>=4.8
 numpy>=1.24
 scipy>=1.10
@@ -9,8 +10,8 @@ joblib>=1.3
 matplotlib>=3.7
 
 # Optional -- only needed to revive src/cnn_loop_closure.py (see the note in
-# that file). None of the reported results depend on it; the retrained
-# classifier deliberately omits the CNN similarity feature.
+# that file). No reported result depends on it; the retrained classifier
+# deliberately omits the CNN similarity feature.
 # torch>=2.0
 # torchvision>=0.15
 

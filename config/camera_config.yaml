@@ -1,33 +1,30 @@
-# TUM RGB-D fr1/xyz Camera Parameters (real-world sequence)
+# TUM RGB-D fr1/xyz camera parameters (real-world sequence).
+#
+# Every key in this file is read by code. Sections that no code consumed
+# (Mapping, LoopClosing, and most of LoopClosure) have been removed rather than
+# left as decoration -- they gave the false impression of being tunable.
 Camera:
-  # TUM RGB-D fr1/xyz camera parameters
-  fx: 517.3  # focal length x
-  fy: 516.5  # focal length y
-  cx: 318.6  # optical center x
-  cy: 255.3  # optical center y
-  
-  # Distortion parameters
+  fx: 517.3          # focal length x
+  fy: 516.5          # focal length y
+  cx: 318.6          # optical centre x
+  cy: 255.3          # optical centre y
+
+  # Distortion. These are large for fr1 and MUST be applied consistently:
+  # keypoints are undistorted once in tracking.py and the camera is treated as
+  # an ideal pinhole thereafter.
   k1: 0.2624
   k2: -0.9531
   p1: -0.0054
   p2: 0.0026
   k3: 1.1633
-  
-  # Image dimensions
+
   width: 640
   height: 480
-  
-  # Depth camera parameters
-  depth_scale: 5000.0  # for converting raw depth to meters
-  depth_min: 0.5      # minimum depth in meters
-  depth_max: 5.0      # maximum depth in meters
-  
-  # Frame rate
-  fps: 10
-  
-# ORB Parameters
-# NOTE: these are the values that produced the documented TUM baseline
-# (ATE 0.235m aligned). system.py reads this section directly.
+
+  depth_scale: 5000.0   # raw depth units per metre (TUM freiburg1)
+  fps: 30               # fr1 sequences are recorded at 30 Hz
+
+# ORB feature extraction (read in system.py)
 ORB:
   nfeatures: 2000
   scale_factor: 1.2
@@ -37,26 +34,26 @@ ORB:
   WTA_K: 2
   patch_size: 31
   fast_threshold: 20
-  
-# Loop Closure Parameters
-LoopClosure:
-  min_loop_score: 0.70  # Higher threshold for more reliable loops
-  min_inliers: 75  # More inliers required for real data
-  search_radius: 50  # Number of frames to search back
-  vocab_size: 1500  # Larger vocabulary for better place recognition
 
-# Tracking Parameters
+# Tracking (read in system.py, passed to Tracker)
 Tracking:
-  minMatches: 50  # More matches required for reliable tracking
-  maxFrames: 200
+  minMatches: 50           # keypoints required before initialisation
+  nnRatio: 0.75            # Lowe's ratio test threshold (true 2-NN ratio)
+  minPnPInliers: 15        # RANSAC consensus size required to accept a pose
+  reprojectionError: 3.0   # px, PnP RANSAC inlier threshold
+  depthMin: 0.5            # m, below this the TUM depth sensor is unreliable
+  depthMax: 5.0            # m, above this likewise
+  # Reference-frame tracking: hold a reference frame and estimate against it
+  # rather than chaining a relative pose every frame. DEFAULT OFF.
+  # On a 300-frame prefix of fr1/xyz this looked like a clear win (ATE
+  # 0.0331 -> 0.0213 m). On the full 796 frames it reverses (ATE 0.0453 ->
+  # 0.0482 m, RPE(1) 0.0169 -> 0.0186 m, scale 0.9975 -> 0.9339). The prefix
+  # was an easier benchmark, exactly the trap documented in RESULTS.md for the
+  # classifier's "easy split". Kept switchable so the result stays checkable.
+  useReferenceFrame: false
+  referenceThreshold: 0.10
 
-# Mapping Parameters
-Mapping:
-  minTriangulationAngle: 2.0  # Minimum angle for triangulation (degrees)
-  minObservations: 3  # Minimum observations for a map point
-  maxReprojectionError: 2.0  # Maximum reprojection error (pixels)
-
-# Loop Closing Parameters
-LoopClosing:
-  minConsistentGroups: 3  # Number of consistent groups required
-  maxLoopSearchTime: 0.2  # Maximum time for loop detection (seconds) 
+# Loop closure (read in system.py, passed to LiveLoopClosureDetector)
+LoopClosure:
+  appearanceThreshold: 0.9   # classifier probability required to become a candidate
+  minGeometricInliers: 25    # PnP inliers required to accept a verified closure

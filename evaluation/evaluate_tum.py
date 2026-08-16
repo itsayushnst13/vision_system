@@ -11,12 +11,16 @@ import numpy as np
 import cv2
 import yaml
 from system import ORBSlam3
-from metrics import align, compute_ate, compute_rpe, trajectory_length, max_step
+from metrics import (align, compute_ate, compute_rpe, trajectory_length,
+                     max_step, summarize, format_summary)
 
 DATASET = os.path.join(os.path.dirname(__file__), "..", "data", "rgbd_dataset_freiburg1_xyz")
 CONFIG = os.path.join(os.path.dirname(__file__), "..", "config", "camera_config.yaml")
 DEPTH_SCALE = 5000.0  # TUM freiburg1 depth scale factor
-MAX_FRAMES = 400       # subsample for reasonable runtime in sandbox
+# Set to None to use every associated frame. Note the previous value of 400
+# produced step = 798 // 400 = 1, i.e. no subsampling at all, while the script
+# still printed "Subsampled to 798 frames (every 1th frame)".
+MAX_FRAMES = None
 
 
 def load_tum_list(path):
@@ -68,10 +72,12 @@ def main():
     matched = associate(rgb_list, depth_list, gt_raw)
     print(f"Associated {len(matched)} rgb-depth-groundtruth triplets")
 
-    if MAX_FRAMES:
+    if MAX_FRAMES and len(matched) > MAX_FRAMES:
         step = max(1, len(matched) // MAX_FRAMES)
         matched = matched[::step]
         print(f"Subsampled to {len(matched)} frames (every {step}th frame)")
+    else:
+        print(f"Using all {len(matched)} associated frames (no subsampling)")
 
     # Pure VO/tracking benchmark -- disable loop closure so this measures
     # the tracker in isolation (evaluate_tum_with_loop_closure.py is the
@@ -122,32 +128,19 @@ def main():
     # global drift that dominates ATE.
     rpe = {d: compute_rpe(est_xyz, gt_xyz, delta=d) for d in (1, 10, 30)}
 
-    print("\n" + "=" * 62)
+    summary = summarize(est_xyz, gt_xyz, label="TUM fr1/xyz visual odometry")
+
+    print("\n" + "=" * 66)
     print("  TUM RGB-D freiburg1_xyz — Visual Odometry Evaluation")
-    print("=" * 62)
-    print(f"  Poses evaluated:          {ate_scaled['n']}")
-    print(f"  Recovered scale factor:   {scale_factor:.4f}  (1.0 = perfectly metric)")
-    print(f"  Est. trajectory length:   {trajectory_length(est_xyz):.3f} m")
-    print(f"  GT   trajectory length:   {trajectory_length(gt_xyz):.3f} m")
-    print(f"  Largest single-frame step:{max_step(est_xyz):.4f} m "
-          f"(GT: {max_step(gt_xyz):.4f} m)")
-
-    print("\n  --- ATE, Sim(3) alignment (scale corrected) ---")
-    print(f"  RMSE {ate_scaled['rmse']:.4f} m | mean {ate_scaled['mean']:.4f} | "
-          f"median {ate_scaled['median']:.4f} | std {ate_scaled['std']:.4f} | "
-          f"max {ate_scaled['max']:.4f}")
-
-    print("\n  --- ATE, SE(3) alignment (raw accumulated drift) ---")
-    print(f"  RMSE {ate_noscale['rmse']:.4f} m | mean {ate_noscale['mean']:.4f} | "
-          f"median {ate_noscale['median']:.4f} | std {ate_noscale['std']:.4f} | "
-          f"max {ate_noscale['max']:.4f}")
-
-    print("\n  --- RPE (translation), local tracking quality ---")
-    for d, r in rpe.items():
-        if r:
-            print(f"  delta={d:>3} frames:  RMSE {r['rmse']:.4f} m | "
-                  f"mean {r['mean']:.4f} | median {r['median']:.4f}")
-    print("=" * 62)
+    print("=" * 66)
+    print(format_summary(summary))
+    print("=" * 66)
+    print("  Tracking path counts:", slam.tracker.stats() if slam.tracker else "n/a")
+    print("=" * 66)
+    print("""  How to read the ratios above: a value >= 1.00 means the system is no
+  better than the trivial estimator for that metric (a fixed point for ATE,
+  zero motion for RPE). Raw metre values alone cannot distinguish a working
+  tracker from a broken one on a sequence with this little motion.""")
 
     os.makedirs(os.path.join(os.path.dirname(__file__), "..", "results"), exist_ok=True)
     save_kwargs = dict(

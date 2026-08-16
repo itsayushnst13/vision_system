@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import numpy as np
 import cv2
 from system import ORBSlam3
+from metrics import summarize, format_summary, compute_ate, compute_rpe, trajectory_length
 
 DATASET = os.path.join(os.path.dirname(__file__), "..", "data", "rgbd_dataset_freiburg1_xyz")
 CONFIG = os.path.join(os.path.dirname(__file__), "..", "config", "camera_config.yaml")
@@ -40,23 +41,10 @@ def associate(rgb_list, depth_list, gt_list, max_diff=0.02):
     return matched
 
 
-def align(est, gt, with_scale=True):
-    mu_est = est.mean(axis=0)
-    mu_gt = gt.mean(axis=0)
-    est_c = est - mu_est
-    gt_c = gt - mu_gt
-    if with_scale:
-        scale = np.sqrt((gt_c**2).sum()) / (np.sqrt((est_c**2).sum()) + 1e-12)
-    else:
-        scale = 1.0
-    H = (est_c * scale).T @ gt_c
-    U, S, Vt = np.linalg.svd(H)
-    d = np.linalg.det(Vt.T @ U.T)
-    D = np.diag([1, 1, d])
-    R = Vt.T @ D @ U.T
-    t = mu_gt - R @ (mu_est * scale)
-    aligned = (R @ (est * scale).T).T + t
-    return aligned, scale
+# NOTE: this script used to carry its own private copy of `align`, with the
+# non-optimal RMS-ratio scale term, so it silently reported different numbers
+# from evaluate_tum.py for the same trajectory. All metrics now come from the
+# shared evaluation/metrics.py.
 
 
 def run_pipeline(matched, enable_loop_closure):
@@ -100,18 +88,28 @@ def run_pipeline(matched, enable_loop_closure):
 
 
 def evaluate(est_xyz, gt_xyz, label):
-    aligned_scaled, scale = align(est_xyz, gt_xyz, with_scale=True)
-    aligned_noscale, _ = align(est_xyz, gt_xyz, with_scale=False)
-    err_scaled = np.linalg.norm(aligned_scaled - gt_xyz, axis=1)
-    err_noscale = np.linalg.norm(aligned_noscale - gt_xyz, axis=1)
+    """
+    Report ATE *and* RPE for each configuration.
+
+    Reporting ATE alone is what allowed the earlier version of this experiment
+    to look like a success. A pose graph that drags keyframes together improves
+    global ATE while wrecking local accuracy, and RPE is the metric that
+    exposes it. Path length is printed for the same reason: a correction that
+    inflates the path far beyond ground truth is compacting the trajectory
+    rather than straightening it.
+    """
+    s = summarize(est_xyz, gt_xyz, label=label)
     print(f"\n--- {label} ---")
-    print(f"  Poses: {len(est_xyz)}  |  Recovered scale: {scale:.4f}")
-    print(f"  ATE RMSE (Sim3-aligned): {np.sqrt(np.mean(err_scaled**2)):.4f} m")
-    print(f"  ATE RMSE (unaligned):    {np.sqrt(np.mean(err_noscale**2)):.4f} m")
+    print(format_summary(s))
     return {
-        "ate_aligned": float(np.sqrt(np.mean(err_scaled**2))),
-        "ate_unaligned": float(np.sqrt(np.mean(err_noscale**2))),
-        "scale": float(scale),
+        "ate_sim3": s["ate_sim3"]["rmse"],
+        "ate_se3": s["ate_se3"]["rmse"],
+        "rpe1": s["rpe"][1]["rmse"] if s["rpe"].get(1) else float("nan"),
+        "rpe1_baseline": s["rpe"][1]["baseline_null_motion"] if s["rpe"].get(1) else float("nan"),
+        "ate_baseline": s["ate_sim3"]["baseline_static_point"],
+        "path_length": s["est_path_length"],
+        "gt_path_length": s["gt_path_length"],
+        "scale": s["ate_sim3"]["scale"],
     }
 
 
@@ -148,13 +146,20 @@ def main():
     print("\n" + "=" * 60)
     print("  SUMMARY")
     print("=" * 60)
-    print(f"  Loop closures detected: {n_loops_on}")
-    print(f"  ATE RMSE (unaligned)  -- OFF: {r_off['ate_unaligned']:.4f} m | "
-          f"ON: {r_on['ate_unaligned']:.4f} m")
-    print(f"  ATE RMSE (aligned)    -- OFF: {r_off['ate_aligned']:.4f} m | "
-          f"ON: {r_on['ate_aligned']:.4f} m")
-    improvement = (r_off['ate_unaligned'] - r_on['ate_unaligned']) / r_off['ate_unaligned'] * 100
-    print(f"  Unaligned ATE change: {improvement:+.1f}%")
+    print(f"  Loop closures accepted: {n_loops_on}")
+    print(f"  {'metric':<28}{'OFF':>12}{'ON':>12}{'baseline':>12}")
+    print(f"  {'ATE RMSE, Sim(3)-aligned':<28}{r_off['ate_sim3']:>12.4f}{r_on['ate_sim3']:>12.4f}{r_off['ate_baseline']:>12.4f}")
+    print(f"  {'ATE RMSE, SE(3)-aligned':<28}{r_off['ate_se3']:>12.4f}{r_on['ate_se3']:>12.4f}{r_off['ate_baseline']:>12.4f}")
+    print(f"  {'RPE RMSE, delta=1':<28}{r_off['rpe1']:>12.4f}{r_on['rpe1']:>12.4f}{r_off['rpe1_baseline']:>12.4f}")
+    print(f"  {'path length (m)':<28}{r_off['path_length']:>12.3f}{r_on['path_length']:>12.3f}{r_off['gt_path_length']:>12.3f}")
+    d_ate = (r_on['ate_se3'] - r_off['ate_se3']) / r_off['ate_se3'] * 100
+    d_rpe = (r_on['rpe1'] - r_off['rpe1']) / r_off['rpe1'] * 100
+    print(f"\n  SE(3) ATE change: {d_ate:+.1f}%   |   RPE(1) change: {d_rpe:+.1f}%")
+    print("""
+  A loop-closure result is only a real improvement if ATE falls WITHOUT RPE
+  rising and WITHOUT the path length moving away from ground truth. An ATE
+  gain paid for with a large RPE regression means the pose graph is compacting
+  the trajectory, not correcting drift.""")
     print("=" * 60)
 
     out_dir = os.path.join(os.path.dirname(__file__), "..", "results")

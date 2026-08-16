@@ -26,11 +26,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 EVAL = os.path.join(HERE, "evaluation")
 DATA = os.path.join(HERE, "data", "rgbd_dataset_freiburg1_xyz")
 
+# Stages that need the TUM dataset are marked needs_data=True. The two
+# dataset-free stages run anywhere, which matters because the synthetic test is
+# what pins down the distortion bug without a 460 MB download.
 STAGES = [
     ("Visual odometry evaluation", "evaluate_tum.py", False),
     ("Loop-closure classifier retraining", "retrain_loop_closure_real_labels.py", True),
     ("Live loop-closure ON vs OFF comparison", "evaluate_tum_with_loop_closure.py", False),
     ("Figure generation", "make_figures.py", False),
+]
+
+# These need no dataset and are always run.
+DATASET_FREE = [
+    ("Synthetic distortion-handling test", os.path.join(HERE, "tests", "test_distortion_bug.py")),
+    ("Recompute published numbers with baselines",
+     os.path.join(EVAL, "recompute_from_committed.py")),
 ]
 
 
@@ -50,7 +60,7 @@ def check_dataset():
 
 
 def run_stage(title, script):
-    path = os.path.join(EVAL, script)
+    path = script if os.path.isabs(script) else os.path.join(EVAL, script)
     print("\n" + "=" * 70)
     print(f"  {title}")
     print(f"  ({os.path.relpath(path, HERE)})")
@@ -70,12 +80,27 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--skip-train", action="store_true",
                     help="reuse existing classifier artifacts instead of retraining")
+    ap.add_argument("--no-dataset", action="store_true",
+                    help="run only the stages that need no TUM download")
     args = ap.parse_args()
 
-    if not check_dataset():
-        return 1
-
     t0 = time.time()
+
+    # Dataset-free stages first, so a user without the download still gets the
+    # synthetic distortion measurement and the recomputed baselines.
+    for title, path in DATASET_FREE:
+        if not run_stage(title, path):
+            print("\nAborting: a stage failed.")
+            return 1
+
+    if args.no_dataset:
+        print("\n[--no-dataset] Skipping the TUM stages.")
+        return 0
+
+    if not check_dataset():
+        print("\nThe dataset-free stages above still completed. "
+              "Re-run without --no-dataset once the sequence is in place.")
+        return 1
     for title, script, is_training in STAGES:
         if is_training and args.skip_train:
             print(f"\n[skipped] {title} (--skip-train)")
